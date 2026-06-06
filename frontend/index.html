@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HR Orchestrator | Automation</title>
+    <!-- Google Fonts: Inter -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <!-- Marked.js for Markdown parsing -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="styles.css">
+</head>
+
+<body class="dark-theme">
+
+    <div class="dynamic-bg"></div>
+
+    <main class="app-container">
+        <header class="app-header">
+            <div class="logo">
+                <span class="gradient-text">HR Orchestrator</span>
+            </div>
+            <p class="subtitle">AI-powered workflow for resume screening, onboarding, and policy Q&A</p>
+        </header>
+
+        <div class="grid-layout">
+
+            <!-- Left Panel: Input form -->
+            <section class="panel glass-panel form-panel">
+                <h2>Candidate Assessment</h2>
+                <form id="orchestrator-form">
+
+                    <div class="input-group">
+                        <label for="pdf_file">Upload Resume PDF</label>
+                        <input type="file" id="pdf_file" name="pdf_file" accept=".pdf" required>
+                        <small>Select a candidate's resume from your computer.</small>
+                    </div>
+
+                    <div class="input-group">
+                        <label for="job_role">Target Job Role</label>
+                        <input type="text" id="job_role" name="job_role" required placeholder="e.g. Software Engineer">
+                    </div>
+
+                    <div class="input-group">
+                        <label>Policy Questions</label>
+                        <div id="questions-container">
+                            <div class="question-row">
+                                <input type="text" class="policy-q" placeholder="What is the vacation policy?"
+                                    value="What is the vacation policy?">
+                                <button type="button" class="btn-icon remove-q" title="Remove question">&times;</button>
+                            </div>
+                        </div>
+                        <button type="button" id="add-question" class="btn-secondary">+ Add Question</button>
+                    </div>
+
+                    <button type="submit" id="submit-btn" class="btn-primary">
+                        <span class="btn-text">Run Orchestrator</span>
+                        <span class="loader hidden"></span>
+                    </button>
+                </form>
+            </section>
+
+            <!-- Right Panel: Results -->
+            <section class="panel glass-panel results-panel">
+                <h2>Analysis Results</h2>
+
+                <div id="empty-state" class="empty-state">
+                    <p>Enter details and run the orchestrator to see the results here.</p>
+                </div>
+
+                <div id="results-content" class="hidden fade-in">
+
+                    <!-- Candidate Score & Info -->
+                    <div class="result-section">
+                        <h3><span class="icon">👤</span> Profile Snapshot</h3>
+                        <div class="score-card">
+                            <div class="score-circle">
+                                <span id="res-score">0</span>%
+                            </div>
+                            <div class="candidate-basic">
+                                <h4 id="res-name">-</h4>
+                                <p><strong>College:</strong> <span id="res-college">-</span></p>
+                                <p><strong>CGPA:</strong> <span id="res-cgpa">-</span></p>
+                            </div>
+                        </div>
+                        <div class="skills-grid">
+                            <div class="skills-block">
+                                <strong>Tech Skills</strong>
+                                <div id="res-tech-skills" class="tags-container"></div>
+                            </div>
+                            <div class="skills-block">
+                                <strong>Soft Skills</strong>
+                                <div id="res-soft-skills" class="tags-container"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Onboarding Plan -->
+                    <div class="result-section">
+                        <h3><span class="icon">📅</span> Onboarding Plan</h3>
+                        <div id="res-onboarding" class="markdown-table-wrapper"></div>
+                    </div>
+
+                    <!-- Policy Answers -->
+                    <div class="result-section">
+                        <h3><span class="icon">🤖</span> Policy Insight</h3>
+                        <div id="res-policy-answers" class="qa-container"></div>
+                    </div>
+
+                </div>
+            </section>
+        </div>
+    </main>
+
+    <script src="script.js"></script>
+</body>
+
+</html>
