@@ -1,146 +1,166 @@
-import os
-from crewai import Agent, Task, Crew
-from crewai import LLM
+"""Onboarding plan agent.
+
+Uses a CrewAI agent (backed by Gemini) to generate a day-by-day onboarding
+plan whose length depends on the candidate's screening score:
+  score <= 50 -> 7 days, 51-80 -> 5 days, > 80 -> 3 days.
+
+Can also be run directly to backfill onboarding plans for hired candidates
+stored in MongoDB:  python onboarding_agent.py
+"""
+import logging
 from typing import Dict
+
+from crewai import Agent, Crew, Task, LLM
 from pymongo import MongoClient
 
-# Unset conflicting environment variables
-# os.environ.pop("GCLOUD_PROJECT", None)
-# os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
-
-
-# --- 1. Load API Key from .env ---
-from dotenv import load_dotenv
-load_dotenv(dotenv_path="../../.env")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-# --- 2. LLM Configuration ---
-# MODIFIED: Corrected to a valid and existing model name
-LLM_MODEL = "gemini-2.5-flash"
-
-print(f"Initializing model: {LLM_MODEL}...")
-
-onboarding_llm = LLM(
-    model=f"gemini/{LLM_MODEL}",
-    api_key=GEMINI_API_KEY
+from config import (
+    GEMINI_MODEL,
+    MONGODB_COLLECTION,
+    MONGODB_DB_NAME,
+    MONGODB_URI,
+    require_gemini_key,
 )
 
-# --- 3. Agent Definition ---
-onboarding_planner = Agent(
-    role="Onboarding Planner",
-    goal="Create detailed and personalized onboarding plans for new employees of varying lengths.",
-    backstory=(
-        "You are an expert HR specialist who designs structured and engaging"
-        " onboarding programs. Your plans are known for being highly effective,"
-        " ensuring new hires feel welcomed, informed, and ready to contribute."
-    ),
-    llm=onboarding_llm,
-    verbose=True,
-    allow_delegation=False
-)
+logger = logging.getLogger(__name__)
 
-# --- 4. Core Onboarding Function (MODIFIED) ---
+_planner = None  # created lazily so importing this module never needs an API key
+
+
+def _get_planner() -> Agent:
+    global _planner
+    if _planner is None:
+        api_key = require_gemini_key()
+        _planner = Agent(
+            role="Onboarding Planner",
+            goal=(
+                "Create detailed and personalized onboarding plans for new "
+                "employees of varying lengths."
+            ),
+            backstory=(
+                "You are an expert HR specialist who designs structured and"
+                " engaging onboarding programs. Your plans are known for being"
+                " highly effective, ensuring new hires feel welcomed, informed,"
+                " and ready to contribute."
+            ),
+            llm=LLM(model=f"gemini/{GEMINI_MODEL}", api_key=api_key),
+            verbose=False,
+            allow_delegation=False,
+        )
+    return _planner
+
+
+def _get_field(candidate: Dict, *keys, default=None):
+    """Read a candidate field tolerating the key spellings used across the
+    project (e.g. 'Tech_skills', 'Tech Skills', 'Tech skills')."""
+    for key in keys:
+        value = candidate.get(key)
+        if value not in (None, "", []):
+            return value
+    return default
+
+
+def _as_skill_text(value) -> str:
+    if isinstance(value, list):
+        return ", ".join(str(v) for v in value)
+    return str(value) if value else "N/A"
+
+
 def generate_onboarding_plan(candidate: Dict) -> str:
-    """
-    Generates an onboarding plan with a length based on the candidate's score.
-    """
-    score = candidate.get('score', 75)
+    """Generate a markdown-table onboarding plan sized to the candidate's score."""
+    score = candidate.get("score", candidate.get("Score", 75))
+    try:
+        score = int(score)
+    except (TypeError, ValueError):
+        score = 75
 
     if score <= 50:
         plan_duration = 7
     elif score <= 80:
         plan_duration = 5
-    else: # score > 80
+    else:
         plan_duration = 3
-    
-    print(f"Candidate score is {score}. Generating a {plan_duration}-day plan...")
 
+    logger.info("Candidate score is %s. Generating a %s-day plan.", score, plan_duration)
+
+    tech = _get_field(candidate, "Tech_skills", "Tech Skills", "Tech skills", default=[])
+    soft = _get_field(candidate, "Soft_skills", "Soft Skills", "Soft skills", default=[])
     candidate_info = (
-        f"Name: {candidate.get('name', 'N/A')}\n"
-        f"College: {candidate.get('College', 'N/A')}\n"
-        f"Tech Skills: {', '.join(candidate.get('Tech skills', []))}\n"
-        f"Soft Skills: {', '.join(candidate.get('Soft skills', []))}\n"
+        f"Name: {_get_field(candidate, 'name', 'Name', default='N/A')}\n"
+        f"College: {_get_field(candidate, 'College', 'college', default='N/A')}\n"
+        f"Tech Skills: {_as_skill_text(tech)}\n"
+        f"Soft Skills: {_as_skill_text(soft)}\n"
     )
-    job_description = candidate.get('job description', 'No job description provided')
+    job_description = _get_field(
+        candidate, "job description", "job_role", "Job Role",
+        default="No job description provided",
+    )
 
-    # The Task's expected_output is now changed to request a table
     onboarding_task = Task(
         description=(
-            f"Generate a concise, day-by-day {plan_duration}-day onboarding plan for the following new hire.\n\n"
+            f"Generate a concise, day-by-day {plan_duration}-day onboarding plan "
+            "for the following new hire.\n\n"
             f"**Job Role:**\n{job_description}\n\n"
             f"**Candidate's Profile:**\n{candidate_info}"
         ),
         expected_output=(
-            # MODIFIED: This now asks for a short, crisp markdown table
-            f"A short and crisp onboarding plan presented in a markdown table. "
-            f"The table should have three columns: 'Day', 'Key Activities', and 'Goal'. "
-            f"Provide one row for each day of the {plan_duration}-day plan."
+            "A short and crisp onboarding plan presented in a markdown table. "
+            "The table should have three columns: 'Day', 'Key Activities', and "
+            f"'Goal'. Provide one row for each day of the {plan_duration}-day plan."
         ),
-        agent=onboarding_planner
+        agent=_get_planner(),
     )
 
-    onboarding_crew = Crew(
-        agents=[onboarding_planner],
-        tasks=[onboarding_task],
-        verbose=False
-    )
-    
-    result = onboarding_crew.kickoff()
+    crew = Crew(agents=[_get_planner()], tasks=[onboarding_task], verbose=False)
+    result = crew.kickoff()
     return result.raw
 
-# --- 5. Database Processing Function ---
-def process_database_candidates(mongo_uri: str, db_name: str, collection_name: str):
-    """
-    Connects to MongoDB, finds hired candidates without a plan, generates one, and updates them.
-    """
+
+def process_database_candidates() -> None:
+    """Find hired candidates in MongoDB without a plan and generate one each."""
+    if not MONGODB_URI:
+        print("MONGODB_URI is not set in .env — nothing to process.")
+        return
+
+    client = None
     try:
-        client = MongoClient(mongo_uri)
-        db = client[db_name]
-        collection = db[collection_name]
+        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=10000)
+        collection = client[MONGODB_DB_NAME][MONGODB_COLLECTION]
         print("\n✅ Successfully connected to MongoDB.")
-        
+
         query = {"Hired": "Yes", "onboarding_plan": {"$exists": False}}
         candidates_to_process = list(collection.find(query))
-        
+
         if not candidates_to_process:
             print("\nNo new hired candidates found to process.")
             return
 
         print(f"\nFound {len(candidates_to_process)} hired candidates to process...")
-        
+
         for candidate in candidates_to_process:
-            candidate_name = candidate.get("name", "Unknown")
-            print("\n" + "="*60)
+            candidate_name = candidate.get("Name", candidate.get("name", "Unknown"))
+            print("\n" + "=" * 60)
             print(f"Processing candidate: {candidate_name}")
-            
+
             plan = generate_onboarding_plan(candidate)
-            
+
             update_result = collection.update_one(
-                {"_id": candidate["_id"]},
-                {"$set": {"onboarding_plan": plan}}
+                {"_id": candidate["_id"]}, {"$set": {"onboarding_plan": plan}}
             )
-            
             if update_result.modified_count > 0:
-                print(f"✅ Successfully generated and saved plan for {candidate_name}.")
+                print(f"✅ Saved onboarding plan for {candidate_name}.")
             else:
-                print(f"⚠️ Plan generated for {candidate_name}, but the database entry was not updated.")
-            
-    except Exception as e:
-        print(f"❌ An error occurred during database processing: {e}")
+                print(f"⚠️ Plan generated for {candidate_name} but not saved.")
+
+    except Exception as exc:
+        print(f"❌ An error occurred during database processing: {exc}")
     finally:
-        if 'client' in locals():
+        if client is not None:
             client.close()
             print("\nMongoDB connection closed.")
 
-# --- 6. Main Execution Block ---
+
 if __name__ == "__main__":
-    MONGO_URI = "mongodb+srv://publicUser:publicPass123@cluster0.qx07p39.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
-    DB_NAME = "resume_screening"
-    COLLECTION_NAME = "candidates"
-
-
-    process_database_candidates(MONGO_URI, DB_NAME, COLLECTION_NAME)
-
-    print("\n" + "="*60)
+    process_database_candidates()
+    print("\n" + "=" * 60)
     print("Onboarding process complete.")
-    print("="*60)
+    print("=" * 60)

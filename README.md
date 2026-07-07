@@ -1,219 +1,178 @@
+# HR Automation Orchestrator
 
-[![Review Assignment Due Date](https://classroom.github.com/assets/deadline-readme-button-22041afd0340ce965d47ae6ef1cefeee28c7c493a6346c4f15d667ab976d596c.svg)](https://classroom.github.com/a/6wbiKQtd)
+An AI-powered HR pipeline that takes a candidate's resume PDF and, in **one API call**:
 
-# HR Automation Sequential Orchestrator
+1. **Screens the resume** — extracts name, college, CGPA and skills, then scores the candidate (0–100) for a target job role.
+2. **Generates an onboarding plan** — a day-by-day markdown table whose length adapts to the score (weaker candidates get a longer, more supportive plan).
+3. **Answers policy questions** — HR policy Q&A grounded in `policy_documents.json`, with conversation memory across questions.
 
-##  Overview
-
-This orchestrator provides a **unified API endpoint** that processes candidates through a complete HR workflow in one sequential operation:
-
-1. **Resume Screening** → Extract and score candidate information
-2. **Onboarding Plan Generation** → Create personalized onboarding schedule
-3. **Policy Q&A** → Answer candidate's policy questions
-
-All three agents work together seamlessly through a single API call.
+Built with **FastAPI**, **Google Gemini**, **CrewAI** (onboarding agent), optional **MongoDB** storage, and a simple HTML/CSS/JS frontend.
 
 ---
 
-##  Architecture
+## Architecture
 
 ```
+        frontend/index.html  (web UI)
+                 │  multipart/form-data
+                 ▼
 ┌─────────────────────────────────────────────────┐
-│           Orchestrator API (Port 9000)          │
-│              /orchestrate endpoint               │
+│        Orchestrator API  (port 9000)            │
+│            POST /orchestrate                    │
 └─────────────────────────────────────────────────┘
-                        │
-        ┌───────────────┼───────────────┐
-        ▼               ▼               ▼
-┌─────────────┐ ┌─────────────┐ ┌─────────────┐
-│   Resume    │ │ Onboarding  │ │  Policy Q&A │
-│   Screening │ │    Agent    │ │    Agent    │
-│    Agent    │ │             │ │             │
-└─────────────┘ └─────────────┘ └─────────────┘
+        │                │                │
+        ▼                ▼                ▼
+┌──────────────┐ ┌───────────────┐ ┌──────────────┐
+│    Resume    │ │  Onboarding   │ │  Policy Q&A  │
+│   Screening  │ │  Plan Agent   │ │    Agent     │
+│ (Gemini+OCR) │ │(CrewAI+Gemini)│ │   (Gemini)   │
+└──────────────┘ └───────────────┘ └──────────────┘
+        │
+        ▼
+   MongoDB (optional — skipped if not configured)
 ```
 
----
-
-##  Project Structure
+## Project structure
 
 ```
-BUILD2BREAK25-ORION/
-├── .github/
+hr-management/
+├── frontend/                     # Web UI (open index.html in a browser)
+│   ├── index.html
+│   ├── script.js
+│   └── styles.css
 ├── hr_management/
-│   ├── policy_service/
-│   ├── read_pdfs/
-│   └── src/
-│       └── hr_management/
-│           ├── __pycache__/
-│           ├── .env
-│           ├── crew.py
-│           ├── main.py
-│           ├── onboarding_agent.py
-│           ├── orchestrator.py              ← Port 9000 (Sequential API)
-│           ├── policy_agent.py
-│           ├── policy_documents.json
-│           ├── policy_qa.py
-│           ├── resume_agent.py
-│           └── .env
+│   ├── .env.example              # Template for your .env (copy & fill in)
+│   ├── read_pdfs/                # Extracted resume text (generated at runtime)
+│   └── src/hr_management/
+│       ├── config.py             # Loads .env, shared settings
+│       ├── orchestrator.py       # ★ Main API (port 9000)
+│       ├── resume_agent.py       # PDF extraction + Gemini screening (standalone: port 8080)
+│       ├── onboarding_agent.py   # CrewAI onboarding planner
+│       ├── policy_agent.py       # Policy Q&A (standalone: port 8001)
+│       ├── policy_documents.json # Editable HR policy texts
+│       ├── crew.py               # Sequential pipeline used by the CLI
+│       └── main.py               # Interactive CLI runner
+├── requirements.txt
 └── README.md
 ```
 
 ---
 
-##  Prerequisites
+## Setup (5 steps)
 
-### Required Software
-- Python 3.8+
-- MongoDB Atlas account (for candidate storage)
-- Gemini API keys
+### 1. Prerequisites
 
-### Required Python Packages
+- **Python 3.10+**
+- **Tesseract OCR** *(optional — only needed for scanned/image resumes; text PDFs work without it)*
+  ```bash
+  sudo apt-get install tesseract-ocr    # Ubuntu/Debian
+  brew install tesseract                # macOS
+  ```
+- A **Google Gemini API key** — free at <https://aistudio.google.com/apikey>
 
-Create `requirements.txt`:
+### 2. Clone and create a virtual environment
 
-```txt
-fastapi==0.104.1
-uvicorn==0.24.0
-pydantic==2.5.0
-pymongo==4.6.0
-requests==2.31.0
-crewai==0.1.0
-google-generativeai==0.3.1
-pdfplumber==0.10.3
-pytesseract==0.3.10
-Pillow==10.1.0
+```bash
+git clone <repo-url>
+cd hr-management
+python3 -m venv .venv
+source .venv/bin/activate     # Windows: .venv\Scripts\activate
 ```
 
-Install dependencies:
+### 3. Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
----
-
-##  Configuration
-
-### 1. API Keys Setup
-
-Update the following files with your Gemini API keys:
-
-**`resume_agent.py`:**
-```python
-GEMINI_API_KEY = "YOUR_RESUME_API_KEY"
-```
-
-**`onboarding_agent.py`:**
-```python
-GEMINI_API_KEY = "YOUR_ONBOARDING_API_KEY"
-```
-
-**`policy_agent.py`:**
-```python
-GEMINI_API_KEY = "YOUR_POLICY_API_KEY"
-```
-
-### 2. Create Policy Documents
-
-Create `policy_service/policy_documents.json`:
-
-```json
-[
-  {
-    "id": 1,
-    "text": "Employees are entitled to 20 days of paid vacation per year. Vacation requests must be submitted at least 2 weeks in advance."
-  },
-  {
-    "id": 2,
-    "text": "Remote work policy allows employees to work from home up to 3 days per week with manager approval."
-  },
-  {
-    "id": 3,
-    "text": "Health insurance coverage begins on the first day of employment and covers medical, dental, and vision."
-  },
-  {
-    "id": 4,
-    "text": "Professional development budget of $2000 per year is available for courses, certifications, and conferences."
-  },
-  {
-    "id": 5,
-    "text": "Sick leave policy provides 10 days per year with no doctor's note required for absences under 3 consecutive days."
-  }
-]
-```
-
-### 3. MongoDB Configuration
-
-Ensure MongoDB connection strings are configured in `resume_agent.py` and `onboarding_agent.py`.
-
-**Default (demo) credentials:**
-```python
-MONGO_URI = "mongodb+srv://publicUser:publicPass123@cluster0.qx07p39.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
-DB_NAME = "resume_screening"
-COLLECTION_NAME = "candidates"
-```
-
----
-
-##  Running the Orchestrator
-
-### Start the Service
+### 4. Configure your API key
 
 ```bash
-uvicorn orchestrator:app --host 0.0.0.0 --port 9000 --reload
+cp hr_management/.env.example hr_management/.env
 ```
 
-**Parameters:**
-- `--host 0.0.0.0`: Makes the service accessible from any IP
-- `--port 9000`: Runs on port 9000
-- `--reload`: Auto-reloads on code changes (development only)
+Open `hr_management/.env` and paste your key:
 
-**Expected Output:**
 ```
-INFO:     Uvicorn running on http://0.0.0.0:9000 (Press CTRL+C to quit)
-INFO:     Started reloader process
-INFO:     Started server process
-INFO:     Waiting for application startup.
-INFO:     Application startup complete.
+GEMINI_API_KEY=your_actual_key_here
 ```
 
-### Access the API
+That's the only required setting. Optional settings (all documented in `.env.example`):
 
-- **Interactive Docs:** http://localhost:9000/docs
-- **Alternative Docs:** http://localhost:9000/redoc
-- **API Endpoint:** http://localhost:9000/orchestrate
+| Variable | Default | Purpose |
+|---|---|---|
+| `GEMINI_MODEL` | `gemini-2.5-flash` | Gemini model to use |
+| `MONGODB_URI` | *(empty)* | MongoDB connection string; leave empty to run without a database |
+| `GEMINI_REQUEST_DELAY` | `0` | Seconds to wait between Gemini calls — set to `4` if you hit free-tier rate limits |
+
+### 5. Start the server
+
+```bash
+cd hr_management/src/hr_management
+uvicorn orchestrator:app --host 0.0.0.0 --port 9000
+```
+
+You should see `Uvicorn running on http://0.0.0.0:9000`. Sanity-check it:
+
+```bash
+curl http://localhost:9000/health
+# {"status":"ok"}
+```
 
 ---
 
-##  API Usage
+## Using the web UI
 
-### Endpoint: `/orchestrate`
+With the server running, open **`frontend/index.html`** in your browser (double-click it, or `xdg-open frontend/index.html`). Then:
 
-**Method:** POST
+1. Upload a resume PDF.
+2. Type the target job role (e.g. *Software Engineer*).
+3. Add any policy questions.
+4. Click **Run Orchestrator** — results (profile, score, onboarding plan, policy answers) appear on the right. A full run typically takes 20–60 seconds.
 
-**Request Body:**
+## Using the API directly
 
-```json
-{
-  "pdf_path": "/path/to/resume.pdf",
-  "job_role": "Software Engineer",
-  "policy_questions": [
-    "How many vacation days do I get?",
-    "What is the remote work policy?",
-    "Tell me about health insurance"
-  ]
-}
+Interactive docs: **http://localhost:9000/docs** (Swagger) or `/redoc`.
+
+### `POST /orchestrate` — multipart/form-data
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `pdf_file` | file | yes | The resume PDF |
+| `job_role` | text | yes | Target job role for scoring |
+| `policy_questions` | text | no | JSON array of questions, e.g. `["What is the leave policy?"]` |
+
+**cURL example:**
+
+```bash
+curl -X POST "http://localhost:9000/orchestrate" \
+  -F "pdf_file=@/path/to/resume.pdf" \
+  -F "job_role=Software Engineer" \
+  -F 'policy_questions=["How many leave days do I get?", "What is the remote work policy?"]'
 ```
 
-**Parameters:**
-- `pdf_path` (required): Absolute or relative path to the PDF resume
-- `job_role` (required): Target job role for scoring
-- `policy_questions` (optional): List of policy-related questions
+**Python example:**
+
+```python
+import requests
+
+with open("resume.pdf", "rb") as f:
+    response = requests.post(
+        "http://localhost:9000/orchestrate",
+        files={"pdf_file": f},
+        data={
+            "job_role": "Software Engineer",
+            "policy_questions": '["How many leave days do I get?"]',
+        },
+    )
+print(response.json())
+```
 
 **Response:**
 
 ```json
 {
+  "session_id": "a1b2c3d4-...",
   "candidate_info": {
     "name": "John Doe",
     "College": "MIT",
@@ -222,455 +181,65 @@ INFO:     Application startup complete.
     "CGPA": "8.5",
     "score": 85
   },
-  "onboarding_plan": "| Day | Key Activities | Goal |\n|-----|----------------|------|\n| 1 | Orientation | Welcome |\n| 2 | Team intro | Integration |\n| 3 | Project setup | Contribution |",
+  "onboarding_plan": "| Day | Key Activities | Goal |\n|-----|-----|-----|\n| 1 | Orientation | Welcome |...",
   "policy_answers": {
-    "How many vacation days do I get?": "Employees are entitled to 20 days of paid vacation per year.",
-    "What is the remote work policy?": "Employees can work from home up to 3 days per week with manager approval.",
-    "Tell me about health insurance": "Health insurance coverage begins on the first day and covers medical, dental, and vision."
+    "How many leave days do I get?": "Employees are entitled to 20 days of paid leave annually..."
   }
 }
 ```
 
----
-
-##  Usage Examples
-
-### Example 1: Using cURL
-
-```bash
-curl -X POST "http://localhost:9000/orchestrate" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "pdf_path": "./resumes/john_doe.pdf",
-    "job_role": "Software Engineer",
-    "policy_questions": [
-      "How many vacation days do I get?",
-      "What is the remote work policy?"
-    ]
-  }'
-```
-
-### Example 2: Using Python Requests
-
-```python
-import requests
-import json
-
-url = "http://localhost:9000/orchestrate"
-
-payload = {
-    "pdf_path": "./resumes/john_doe.pdf",
-    "job_role": "Software Engineer",
-    "policy_questions": [
-        "How many vacation days do I get?",
-        "What is the remote work policy?"
-    ]
-}
-
-response = requests.post(url, json=payload)
-result = response.json()
-
-print("Candidate:", result["candidate_info"]["name"])
-print("Score:", result["candidate_info"]["score"])
-print("\nOnboarding Plan:")
-print(result["onboarding_plan"])
-print("\nPolicy Answers:")
-for question, answer in result["policy_answers"].items():
-    print(f"Q: {question}")
-    print(f"A: {answer}\n")
-```
-
-### Example 3: Using JavaScript (Fetch API)
-
-```javascript
-const orchestrate = async () => {
-  const response = await fetch('http://localhost:9000/orchestrate', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      pdf_path: './resumes/john_doe.pdf',
-      job_role: 'Software Engineer',
-      policy_questions: [
-        'How many vacation days do I get?',
-        'What is the remote work policy?'
-      ]
-    })
-  });
-  
-  const result = await response.json();
-  console.log('Candidate Info:', result.candidate_info);
-  console.log('Onboarding Plan:', result.onboarding_plan);
-  console.log('Policy Answers:', result.policy_answers);
-};
-
-orchestrate();
-```
-
-### Example 4: Testing in API Docs
-
-1. Navigate to http://localhost:9000/docs
-2. Click on **POST /orchestrate**
-3. Click **"Try it out"**
-4. Fill in the request body:
-   ```json
-   {
-     "pdf_path": "./test_resume.pdf",
-     "job_role": "Data Scientist",
-     "policy_questions": ["What is the sick leave policy?"]
-   }
-   ```
-5. Click **"Execute"**
-6. View the response below
+Errors return a JSON body with a `detail` message — `400` for bad input (non-PDF file, unreadable PDF, empty job role), `500`/`502` for configuration or upstream API problems.
 
 ---
 
-##  Workflow Details
+## Other ways to run it
 
-### Step 1: Resume Screening
-- Extracts text from PDF using `pdfplumber` and OCR
-- Sends text to Gemini API for field extraction
-- Scores candidate based on job role match
+All commands below are run from `hr_management/src/hr_management/`.
 
-### Step 2: Onboarding Plan Generation
-- Takes candidate score and creates personalized plan
-- Score ≤50: 7-day plan
-- Score 51-80: 5-day plan
-- Score >80: 3-day plan
-- Returns markdown table format
+| What | Command | Notes |
+|---|---|---|
+| **Interactive CLI** (no server) | `python main.py` | Prompts for a PDF path, job role and questions |
+| **Resume agent standalone** | `python resume_agent.py` | Simple HTML flow on port 8080: upload → analyze → mark top-N hired (hiring needs MongoDB) |
+| **Policy Q&A standalone** | `uvicorn policy_agent:app --port 8001` | `POST /policy_qa` with `{"questions": [...]}` |
+| **Onboarding backfill** | `python onboarding_agent.py` | Generates plans for hired candidates in MongoDB that don't have one yet |
 
-### Step 3: Policy Q&A
-- Retrieves relevant policy documents
-- Uses conversation memory for context
-- Generates answers using Gemini API
+## Customizing the policies
+
+Edit `hr_management/src/hr_management/policy_documents.json` — a list of objects with `section` and `text` keys. The Q&A agent retrieves the most relevant paragraphs by keyword overlap and answers from them. Restart the server after editing.
 
 ---
 
-##  Session Memory
+## Troubleshooting
 
-The orchestrator maintains session-based memory:
+| Problem | Fix |
+|---|---|
+| `GEMINI_API_KEY is not set` | Copy `hr_management/.env.example` to `hr_management/.env` and paste your key. |
+| `Form data requires "python-multipart"` | `pip install -r requirements.txt` (installs `python-multipart`). |
+| Gemini rate-limit / quota errors (429) | Set `GEMINI_REQUEST_DELAY=4` in `.env`, or use a paid-tier key. |
+| Scanned PDF returns "Could not extract any text" | Install Tesseract OCR (see Prerequisites). |
+| Port 9000 already in use | `uvicorn orchestrator:app --port 9001` (and update `API_BASE_URL` at the top of `frontend/script.js`). |
+| Candidates not saved to database | That's expected when `MONGODB_URI` is unset — storage is optional. Set it in `.env` to enable. |
+| `ModuleNotFoundError` on startup | Make sure you start uvicorn **from** `hr_management/src/hr_management/` with your virtualenv activated. |
 
-```python
-SESSION_MEMORY[session_id] = {
-    "policy": [
-        {"question": "...", "answer": "..."},
-        {"question": "...", "answer": "..."}
-    ]
-}
-```
+## Security notes
 
-Each API call generates a unique `session_id` for tracking.
+- **Never commit `.env`** — it is already in `.gitignore`.
+- MongoDB credentials live only in `.env` (`MONGODB_URI`), never in code.
+- The API currently has no authentication and CORS is open — fine for local demos; add an auth layer (e.g. FastAPI `HTTPBearer`) and restrict `allow_origins` before exposing it publicly.
 
----
-
-##  Troubleshooting
-
-### Issue: "Module not found"
-
-**Solution:**
-```bash
-# Ensure all agent files are in the same directory
-ls -la
-# Should show: orchestrator.py, resume_agent.py, onboarding_agent.py, policy_agent.py
-
-# Reinstall dependencies
-pip install -r requirements.txt
-```
-
-### Issue: "File not found: policy_documents.json"
-
-**Solution:**
-```bash
-# Create the policy_service directory
-mkdir -p policy_service
-
-# Create the JSON file with policy data
-# (See Configuration section above)
-```
-
-### Issue: "Connection to MongoDB failed"
-
-**Solution:**
-1. Check internet connection
-2. Verify MongoDB credentials in agent files
-3. Whitelist your IP in MongoDB Atlas
-4. Test connection:
-   ```bash
-   mongosh "mongodb+srv://publicUser:publicPass123@cluster0.qx07p39.mongodb.net/resume_screening"
-   ```
-
-### Issue: "PDF extraction failed"
-
-**Solution:**
-```bash
-# Ensure Tesseract is installed
-which tesseract  # On Linux/Mac
-where tesseract  # On Windows
-
-# Install if missing:
-# Ubuntu: sudo apt-get install tesseract-ocr
-# Mac: brew install tesseract
-# Windows: Download from GitHub
-
-# Check PDF path is correct
-ls -la /path/to/resume.pdf
-```
-
-### Issue: "Gemini API error"
-
-**Solution:**
-1. Verify API keys are correct
-2. Check API quota/limits
-3. Test API key:
-   ```bash
-   curl "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=YOUR_API_KEY" \
-     -H "Content-Type: application/json" \
-     -d '{"contents":[{"parts":[{"text":"Hello"}]}]}'
-   ```
-
-### Issue: "Port 9000 already in use"
-
-**Solution:**
-```bash
-# Find process using port 9000
-lsof -ti:9000  # Linux/Mac
-netstat -ano | findstr :9000  # Windows
-
-# Kill the process
-kill -9 <PID>  # Linux/Mac
-taskkill /PID <PID> /F  # Windows
-
-# Or use a different port
-uvicorn orchestrator:app --port 9001
-```
-
----
-
-##  Performance Considerations
-
-### Processing Time
-- **Resume extraction:** 2-5 seconds
-- **Gemini API calls:** 1-3 seconds each
-- **Total per candidate:** 10-20 seconds
-
-### Optimization Tips
-1. **Use async operations** for parallel API calls
-2. **Cache policy documents** in memory
-3. **Implement request queuing** for high load
-4. **Add connection pooling** for MongoDB
-
----
-
-##  Security Best Practices
-
-1. **Never commit API keys** to version control
-   ```bash
-   # Add to .gitignore
-   echo "*.env" >> .gitignore
-   echo "*_config.py" >> .gitignore
-   ```
-
-2. **Use environment variables**
-   ```python
-   import os
-   GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-   ```
-
-3. **Restrict file access**
-   ```python
-   # Validate PDF paths
-   import os
-   if not os.path.exists(pdf_path):
-       raise HTTPException(status_code=400, detail="File not found")
-   ```
-
-4. **Add authentication**
-   ```python
-   from fastapi.security import HTTPBearer
-   security = HTTPBearer()
-   ```
-
----
-
-##  Testing
-
-### Manual Testing
-
-```bash
-# Start the orchestrator
-uvicorn orchestrator:app --port 9000
-
-# In another terminal, test the endpoint
-curl -X POST "http://localhost:9000/orchestrate" \
-  -H "Content-Type: application/json" \
-  -d @test_payload.json
-```
-
-### Automated Testing
-
-Create `test_orchestrator.py`:
-
-```python
-import requests
-import pytest
-
-BASE_URL = "http://localhost:9000"
-
-def test_orchestrate_endpoint():
-    payload = {
-        "pdf_path": "./test_resume.pdf",
-        "job_role": "Software Engineer",
-        "policy_questions": ["What is the vacation policy?"]
-    }
-    
-    response = requests.post(f"{BASE_URL}/orchestrate", json=payload)
-    assert response.status_code == 200
-    
-    data = response.json()
-    assert "candidate_info" in data
-    assert "onboarding_plan" in data
-    assert "policy_answers" in data
-
-if __name__ == "__main__":
-    pytest.main([__file__])
-```
-
-Run tests:
-```bash
-pytest test_orchestrator.py
-```
-
----
-
-## 📈 Monitoring
-
-### Enable Logging
-
-```python
-import logging
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-
-logger = logging.getLogger(__name__)
-
-@app.post("/orchestrate")
-async def orchestrate_workflow(input_data: OrchestratorRequest):
-    logger.info(f"Processing candidate for role: {input_data.job_role}")
-    # ... rest of code
-```
-
-### View Logs
-
-```bash
-# Run with logging output
-uvicorn orchestrator:app --port 9000 --log-level info
-
-# Or redirect to file
-uvicorn orchestrator:app --port 9000 > orchestrator.log 2>&1
-```
-
----
-
-##  Development Mode
-
-Run with auto-reload for development:
-
-```bash
-uvicorn orchestrator:app --reload --port 9000 --log-level debug
-```
-
-This will:
-- Auto-reload on code changes
-- Show detailed debug logs
-- Help during development
-
----
-
-## Production Deployment
-
-### Using Gunicorn (Recommended)
+## Production deployment
 
 ```bash
 pip install gunicorn
-
-gunicorn orchestrator:app \
-  --workers 4 \
-  --worker-class uvicorn.workers.UvicornWorker \
-  --bind 0.0.0.0:9000 \
-  --timeout 120
+cd hr_management/src/hr_management
+gunicorn orchestrator:app --workers 2 --worker-class uvicorn.workers.UvicornWorker \
+  --bind 0.0.0.0:9000 --timeout 300
 ```
 
-### Using Docker
-
-Create `Dockerfile`:
-
-```dockerfile
-FROM python:3.9
-
-WORKDIR /app
-
-COPY requirements.txt .
-RUN pip install -r requirements.txt
-
-COPY . .
-
-CMD ["uvicorn", "orchestrator:app", "--host", "0.0.0.0", "--port", "9000"]
-```
-
-Build and run:
-
-```bash
-docker build -t hr-orchestrator .
-docker run -p 9000:9000 hr-orchestrator
-```
+The long `--timeout` matters: a full run makes several sequential LLM calls.
 
 ---
 
-##  API Documentation
-
-Once running, access interactive documentation at:
-
-- **Swagger UI:** http://localhost:9000/docs
-- **ReDoc:** http://localhost:9000/redoc
-- **OpenAPI JSON:** http://localhost:9000/openapi.json
-
----
-
-##  Next Steps
-
-1. **Add authentication** for secure access
-2. **Implement rate limiting** to prevent abuse
-3. **Add batch processing** for multiple resumes
-4. **Create frontend UI** for easier interaction
-5. **Add webhook support** for async notifications
-6. **Implement caching** for better performance
-7. **Add integration with Google Calendar or Notion** for organisation of onboarding schedule
-
----
-
-##  Support
-
-For issues or questions:
-1. Check the troubleshooting section
-2. Review API documentation at `/docs`
-3. Verify all dependencies are installed
-4. Check logs for error messages
-
----
-
-##  License
+## License
 
 This project is for educational and demonstration purposes.
-
----
-
-**Last Updated:** October 2025  
-**Version:** 1.0  
-**Port:** 9000  
-**Status:** Production Ready
-
-for swagger ui: https://<codespace name>-9000.app.github.dev/docs#/default/orchestrate_workflow_orchestrate_post

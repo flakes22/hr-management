@@ -1,1 +1,14 @@
+# Secrets
 .env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Runtime artifacts
+*.log
+temp_*
+response.json
+hr_management/read_pdfs/*.txt

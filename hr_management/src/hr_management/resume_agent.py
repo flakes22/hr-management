@@ -1,20 +1,46 @@
-from fastapi import FastAPI, File, UploadFile, Form
-from fastapi.responses import HTMLResponse
-import uvicorn
-import os
-import requests
+"""Resume screening agent.
+
+Provides:
+  * PDF text extraction (pdfplumber + Tesseract OCR fallback)
+  * Gemini-based field extraction and job-fit scoring
+  * An optional standalone FastAPI app (port 8080) with a simple HTML flow:
+    upload resume -> analyze for a job role -> mark top candidates as hired.
+
+MongoDB storage is optional: if MONGODB_URI is not configured the agent
+simply skips persistence and logs a notice.
+"""
+import ast
 import json
+import logging
+import os
+import re
+
+import google.generativeai as genai
 import pdfplumber
 import pytesseract
-from PIL import Image
-import re
-import google.generativeai as genai
-import ast
+from fastapi import FastAPI, File, Form, UploadFile
+from fastapi.responses import HTMLResponse
 from pymongo import MongoClient
-import urllib.parse
-from dotenv import load_dotenv
 
-app = FastAPI()
+from config import (
+    GEMINI_API_KEY,
+    GEMINI_MODEL,
+    MONGODB_COLLECTION,
+    MONGODB_DB_NAME,
+    MONGODB_URI,
+    require_gemini_key,
+)
+
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="Resume Screening Agent")
+
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+
+READ_PDFS_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "../../read_pdfs")
+)
 
 HTML_FORM = """
 <html>
@@ -52,147 +78,186 @@ SELECT_N_FORM = """
 </html>
 """
 
-load_dotenv(dotenv_path="../../.env")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-# os.environ["GOOGLE_API_KEY"] = GEMINI_API_KEY
-if GEMINI_API_KEY:
-    os.environ["GOOGLE_API_KEY"] = GEMINI_API_KEY
-    genai.configure(api_key=GEMINI_API_KEY)
-else:
-    raise RuntimeError("GEMINI_API_KEY not found in environment. Please check your .env file.")
-READ_PDFS_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../read_pdfs"))
 
-class ResumeConfig:
-    MONGODB_USERNAME = "publicUser"
-    MONGODB_PASSWORD = "publicPass123"
-    MONGODB_CLUSTER = "cluster0.qx07p39.mongodb.net"
-    DATABASE_NAME = "resume_screening"
-    ENCODED_PASSWORD = urllib.parse.quote_plus(MONGODB_PASSWORD)
-    MONGODB_URL = (
-        f"mongodb+srv://{MONGODB_USERNAME}:{ENCODED_PASSWORD}"
-        f"@{MONGODB_CLUSTER}/"
-        f"?retryWrites=true&w=majority&appName=Cluster0"
-    )
-    CANDIDATES_COLLECTION = "candidates"
+# ---------------------------------------------------------------- PDF reading
+def extract_text_from_pdf(pdf_path: str) -> str:
+    """Extract text from a PDF, combining embedded text with OCR.
 
-@app.get("/", response_class=HTMLResponse)
-async def main():
-    return HTML_FORM
-
-def extract_text_from_pdf(pdf_path):
+    OCR requires the `tesseract` binary; if it is missing we fall back to
+    embedded text only instead of failing the whole request.
+    """
     text = ""
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
             page_text = page.extract_text() or ""
-            img = page.to_image(resolution=200).original.convert("L")
-            img = img.point(lambda x: 0 if x < 180 else 255, '1')
-            ocr_text = pytesseract.image_to_string(img)
-            combined = page_text + "\n" + ocr_text
-            text += combined
+            ocr_text = ""
+            try:
+                img = page.to_image(resolution=200).original.convert("L")
+                img = img.point(lambda x: 0 if x < 180 else 255, "1")
+                ocr_text = pytesseract.image_to_string(img)
+            except Exception as exc:  # tesseract missing or OCR failure
+                logger.warning("OCR skipped for a page: %s", exc)
+            text += page_text + "\n" + ocr_text
+    if not text.strip():
+        raise ValueError(
+            "Could not extract any text from the PDF. "
+            "If it is a scanned document, install Tesseract OCR."
+        )
     return text
 
-@app.post("/upload_resume/", response_class=HTMLResponse)
-async def upload_resume(pdf_file: UploadFile = File(...)):
-    # Save PDF and extract text
-    pdf_path = f"temp_{pdf_file.filename}"
-    with open(pdf_path, "wb") as f:
-        f.write(await pdf_file.read())
-    resume_text = extract_text_from_pdf(pdf_path)
-    os.remove(pdf_path)
 
-    # Store extracted text in numbered .txt file
-    os.makedirs(READ_PDFS_PATH, exist_ok=True)
-    existing_files = [f for f in os.listdir(READ_PDFS_PATH) if f.startswith("resume_text_") and f.endswith(".txt")]
-    next_num = len(existing_files) + 1
-    output_path = os.path.join(READ_PDFS_PATH, f"resume_text_{next_num}.txt")
-    with open(output_path, "w", encoding="utf-8") as f2:
-        f2.write(resume_text)
+# ------------------------------------------------------------- Gemini helpers
+def _gemini_model() -> "genai.GenerativeModel":
+    require_gemini_key()
+    return genai.GenerativeModel(GEMINI_MODEL)
 
-    # After upload, ask for job role
-    html = JOB_ROLE_FORM
-    return HTMLResponse(content=html)
 
-def call_gemini_extract_fields(resume_text):
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-2.5-flash')
+def _normalize_skills(value) -> list:
+    """Gemini may return skills as a list, a comma-separated string, or null."""
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    if isinstance(value, str) and value.strip():
+        return [s.strip() for s in value.split(",") if s.strip()]
+    return []
+
+
+def call_gemini_extract_fields(resume_text: str) -> dict:
+    """Ask Gemini to pull structured fields out of raw resume text."""
+    model = _gemini_model()
     prompt = (
         "Extract the following fields from the resume text. "
-        "Return a JSON object with keys: Name, College, CGPA, Tech Skills, Soft Skills. "
-        "Resume text: " + resume_text
+        "Return ONLY a JSON object with keys: Name, College, CGPA, "
+        "Tech Skills, Soft Skills. 'Tech Skills' and 'Soft Skills' must be "
+        "JSON arrays of strings. Use \"N/A\" when a field is missing.\n"
+        "Resume text:\n" + resume_text
     )
     response = model.generate_content(prompt)
-    cleaned = re.sub(r"^```json\s*|^```\s*|```$", "", response.text.strip(), flags=re.MULTILINE).strip()
+    cleaned = re.sub(
+        r"^```json\s*|^```\s*|```$", "", response.text.strip(), flags=re.MULTILINE
+    ).strip()
     try:
         fields = json.loads(cleaned)
     except Exception:
         try:
             fields = ast.literal_eval(cleaned)
         except Exception:
-            print("Failed to parse fields from Gemini response.")
+            logger.error("Failed to parse fields from Gemini response: %r", cleaned)
             fields = {}
+    if not isinstance(fields, dict):
+        fields = {}
+    fields["Tech Skills"] = _normalize_skills(fields.get("Tech Skills"))
+    fields["Soft Skills"] = _normalize_skills(fields.get("Soft Skills"))
+    fields["Name"] = str(fields.get("Name") or "N/A")
+    fields["College"] = str(fields.get("College") or "N/A")
+    fields["CGPA"] = str(fields.get("CGPA") or "N/A")
     return fields
 
-def call_gemini_score(fields, job_role):
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-2.5-flash')
+
+def call_gemini_score(fields: dict, job_role: str) -> int:
+    """Score the candidate 0-100 for the given job role."""
+    model = _gemini_model()
     prompt = (
         f"Score the following candidate out of 100 for the job role '{job_role}'.\n"
         f"Details: {fields}\n"
         "Give only the score as a number."
     )
     response = model.generate_content(prompt)
-    score_text = response.text.strip()
-    score_match = re.search(r"\d+", score_text)
-    return int(score_match.group()) if score_match else 0
+    score_match = re.search(r"\d+", response.text.strip())
+    score = int(score_match.group()) if score_match else 0
+    return max(0, min(100, score))
 
-def store_candidate_in_mongo(candidate_data):
+
+# ---------------------------------------------------------------- MongoDB
+def store_candidate_in_mongo(candidate_data: dict) -> bool:
+    """Persist a candidate document. Returns True on success."""
+    if not MONGODB_URI:
+        logger.info("MONGODB_URI not set — skipping database storage.")
+        return False
     try:
-        client = MongoClient(ResumeConfig.MONGODB_URL)
-        db = client[ResumeConfig.DATABASE_NAME]
-        db[ResumeConfig.CANDIDATES_COLLECTION].insert_one(candidate_data)
-    except Exception as e:
-        print(f"MongoDB insert error: {e}")
+        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=10000)
+        client[MONGODB_DB_NAME][MONGODB_COLLECTION].insert_one(candidate_data)
+        client.close()
+        return True
+    except Exception as exc:
+        logger.error("MongoDB insert error: %s", exc)
+        return False
+
+
+# ------------------------------------------------- Standalone web app (8080)
+@app.get("/", response_class=HTMLResponse)
+async def main():
+    return HTML_FORM
+
+
+def _next_resume_number() -> int:
+    os.makedirs(READ_PDFS_PATH, exist_ok=True)
+    nums = []
+    for name in os.listdir(READ_PDFS_PATH):
+        match = re.fullmatch(r"resume_text_(\d+)\.txt", name)
+        if match:
+            nums.append(int(match.group(1)))
+    return max(nums, default=0) + 1
+
+
+@app.post("/upload_resume/", response_class=HTMLResponse)
+async def upload_resume(pdf_file: UploadFile = File(...)):
+    pdf_path = f"temp_{pdf_file.filename}"
+    with open(pdf_path, "wb") as f:
+        f.write(await pdf_file.read())
+    try:
+        resume_text = extract_text_from_pdf(pdf_path)
+    finally:
+        os.remove(pdf_path)
+
+    output_path = os.path.join(
+        READ_PDFS_PATH, f"resume_text_{_next_resume_number()}.txt"
+    )
+    with open(output_path, "w", encoding="utf-8") as f2:
+        f2.write(resume_text)
+
+    return HTMLResponse(content=JOB_ROLE_FORM)
+
 
 @app.post("/analyze_resume/", response_class=HTMLResponse)
 async def analyze_resume(job_role: str = Form(...)):
-    # Find the latest resume_text_N.txt file
-    resume_files = [f for f in os.listdir(READ_PDFS_PATH) if f.startswith("resume_text_") and f.endswith(".txt")]
+    resume_files = [
+        f
+        for f in os.listdir(READ_PDFS_PATH)
+        if re.fullmatch(r"resume_text_(\d+)\.txt", f)
+    ]
     if not resume_files:
         return HTMLResponse(content="<h2>No resume found. Please upload first.</h2>")
-    latest_file = sorted(resume_files)[-1]
-    resume_path = os.path.join(READ_PDFS_PATH, latest_file)
-    with open(resume_path, "r", encoding="utf-8") as f:
+    latest_file = max(resume_files, key=lambda f: int(re.search(r"\d+", f).group()))
+    with open(os.path.join(READ_PDFS_PATH, latest_file), encoding="utf-8") as f:
         resume_text = f.read()
 
-    # Extract fields using Gemini
     fields = call_gemini_extract_fields(resume_text)
     score = call_gemini_score(fields, job_role)
 
-    # Store in MongoDB Atlas using ResumeConfig
     candidate_data = {
-        "Name": fields.get('Name', 'N/A'),
-        "College": fields.get('College', 'N/A'),
-        "CGPA": fields.get('CGPA', 'N/A'),
-        "Tech Skills": fields.get('Tech Skills', 'N/A'),
-        "Soft Skills": fields.get('Soft Skills', 'N/A'),
+        "Name": fields["Name"],
+        "College": fields["College"],
+        "CGPA": fields["CGPA"],
+        "Tech Skills": fields["Tech Skills"],
+        "Soft Skills": fields["Soft Skills"],
         "Score": score,
         "Job Role": job_role,
-        "Source File": latest_file
+        "Source File": latest_file,
     }
-    store_candidate_in_mongo(candidate_data)
+    stored = store_candidate_in_mongo(candidate_data)
 
-    # Display results on UI with a button to go to select_hired
     html = f"""
     <html>
         <body>
             <h2>Resume Analysis for Job Role: {job_role}</h2>
             <ul>
-                <li><strong>Name:</strong> {fields.get('Name', 'N/A')}</li>
-                <li><strong>College:</strong> {fields.get('College', 'N/A')}</li>
-                <li><strong>CGPA:</strong> {fields.get('CGPA', 'N/A')}</li>
-                <li><strong>Tech Skills:</strong> {fields.get('Tech Skills', 'N/A')}</li>
-                <li><strong>Soft Skills:</strong> {fields.get('Soft Skills', 'N/A')}</li>
+                <li><strong>Name:</strong> {fields['Name']}</li>
+                <li><strong>College:</strong> {fields['College']}</li>
+                <li><strong>CGPA:</strong> {fields['CGPA']}</li>
+                <li><strong>Tech Skills:</strong> {', '.join(fields['Tech Skills']) or 'N/A'}</li>
+                <li><strong>Soft Skills:</strong> {', '.join(fields['Soft Skills']) or 'N/A'}</li>
                 <li><strong>Score (out of 100):</strong> {score}</li>
+                <li><strong>Saved to database:</strong> {'Yes' if stored else 'No'}</li>
             </ul>
             <form action="/select_hired/" method="get">
                 <button type="submit">Go to Hire Candidates</button>
@@ -203,33 +268,41 @@ async def analyze_resume(job_role: str = Form(...)):
     """
     return HTMLResponse(content=html)
 
+
 @app.get("/select_hired/", response_class=HTMLResponse)
 async def select_hired():
     return SELECT_N_FORM
 
+
 @app.post("/mark_hired/", response_class=HTMLResponse)
 async def mark_hired(n_hire: int = Form(...)):
+    if not MONGODB_URI:
+        return HTMLResponse(
+            content="<h2>Database is not configured (set MONGODB_URI in .env).</h2>"
+        )
     try:
-        client = MongoClient(ResumeConfig.MONGODB_URL)
-        db = client[ResumeConfig.DATABASE_NAME]
-        collection = db[ResumeConfig.CANDIDATES_COLLECTION]
-        # Set "Hired" to "No" for all candidates if not already set
+        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=10000)
+        collection = client[MONGODB_DB_NAME][MONGODB_COLLECTION]
         collection.update_many({}, {"$set": {"Hired": "No"}})
-        # Find top n_hire candidates by score
         top_candidates = list(collection.find().sort("Score", -1).limit(n_hire))
-        # Mark them as hired
         for candidate in top_candidates:
-            collection.update_one({"_id": candidate["_id"]}, {"$set": {"Hired": "Yes"}})
+            collection.update_one(
+                {"_id": candidate["_id"]}, {"$set": {"Hired": "Yes"}}
+            )
+        client.close()
         html = "<html><body><h2>Top candidates marked as Hired!</h2><ul>"
         for candidate in top_candidates:
-            html += f"<li>{candidate.get('Name', 'N/A')} (Score: {candidate.get('Score', 'N/A')})</li>"
+            html += (
+                f"<li>{candidate.get('Name', 'N/A')} "
+                f"(Score: {candidate.get('Score', 'N/A')})</li>"
+            )
         html += "</ul><a href='/'>Upload another resume</a></body></html>"
         return HTMLResponse(content=html)
-    except Exception as e:
-        return HTMLResponse(content=f"<h2>Error: {e}</h2>")
+    except Exception as exc:
+        return HTMLResponse(content=f"<h2>Error: {exc}</h2>")
 
-# Ensure read_pdfs folder exists at startup
-os.makedirs(READ_PDFS_PATH, exist_ok=True)
 
 if __name__ == "__main__":
+    import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8080)

@@ -1,3 +1,13 @@
+// Base URL of the orchestrator API (change if the backend runs elsewhere).
+const API_BASE_URL = 'http://localhost:9000';
+
+// Escape user/AI-provided text before inserting it into HTML.
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.innerText = String(text);
+    return div.innerHTML;
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     const questionContainer = document.getElementById('questions-container');
     const addQuestionBtn = document.getElementById('add-question');
@@ -57,14 +67,18 @@ document.addEventListener('DOMContentLoaded', () => {
         formData.append("policy_questions", JSON.stringify(policyQuestions));
 
         try {
-            const response = await fetch('http://localhost:9000/orchestrate', {
+            const response = await fetch(`${API_BASE_URL}/orchestrate`, {
                 method: 'POST',
                 body: formData
             });
 
             if (!response.ok) {
-                const err = await response.json();
-                throw new Error(err.detail || 'API request failed');
+                let detail = `API request failed (HTTP ${response.status})`;
+                try {
+                    const err = await response.json();
+                    if (err.detail) detail = err.detail;
+                } catch (_) { /* non-JSON error body */ }
+                throw new Error(detail);
             }
 
             const data = await response.json();
@@ -140,8 +154,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 const card = document.createElement('div');
                 card.className = 'qa-card';
                 card.innerHTML = `
-                    <div class="q">Q: ${q}</div>
-                    <div class="a">A: ${a}</div>
+                    <div class="q">Q: ${escapeHtml(q)}</div>
+                    <div class="a">A: ${escapeHtml(a)}</div>
                 `;
                 policyEl.appendChild(card);
             }
